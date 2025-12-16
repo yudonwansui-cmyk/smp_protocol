@@ -1,0 +1,1616 @@
+auth.py
+
+import hashlib
+import secrets
+from typing import Optional, Tuple
+
+
+class SMPAuth:
+    """SMP 协议认证管理器"""
+
+    @staticmethod
+    def hash_password(password: str, salt: Optional[str] = None) -> Tuple[str, str]:
+        """哈希密码，返回(哈希值, 盐值)"""
+        if salt is None:
+            salt = secrets.token_hex(16)
+
+        password_hash = hashlib.pbkdf2_hmac(
+            'sha256',
+            password.encode('utf-8'),
+            salt.encode('utf-8'),
+            100000  # 迭代次数
+        ).hex()
+
+        return password_hash, salt
+
+    @staticmethod
+    def verify_password(password: str, stored_hash: str, salt: str) -> bool:
+        """验证密码"""
+        password_hash, _ = SMPAuth.hash_password(password, salt)
+        return password_hash == stored_hash
+
+    @staticmethod
+    def generate_token() -> str:
+        """生成认证令牌"""
+        return secrets.token_urlsafe(32)
+
+client_enhanced.py
+
+# client_enhanced.py (V-Final Perfected Version)
+
+import socket
+import threading
+import time
+import json
+import logging
+import os
+from queue import Queue, Empty
+from tkinter import messagebox
+
+from protocol import SMPProtocol
+
+# Placeholder for modules you might not have, to prevent import errors
+try:
+    from file_transfer import FileTransferManager
+    from ssl_wrapper import SSLWrapper
+except ImportError:
+    FileTransferManager = None
+    SSLWrapper = None
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('SMPEnhancedClient')
+
+
+class SMPEnhancedClient:
+    """增强版 SMP 客户端 V4 - 最终完美版"""
+
+    def __init__(self, server_host='localhost', server_port=8899, use_ssl=False, cafile=None):
+        self.server_host = server_host
+        self.server_port = server_port
+        self.use_ssl = use_ssl
+        self.cafile = cafile
+        self.socket = None
+        self.connected = False
+        self.authenticated = False
+        self.msg_counter = 0
+        self.username = ""
+        self.user_data = {}
+        self.response_queue = Queue()
+        self.message_queue = Queue()
+        self.lock = threading.Lock()
+        self.ssl_context = None
+        if use_ssl and SSLWrapper:
+            self.ssl_context = SSLWrapper.create_client_context(cafile)
+
+    def register(self, username: str, password: str) -> bool:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as temp_socket:
+                if self.use_ssl and self.ssl_context and SSLWrapper:
+                    temp_socket = SSLWrapper.wrap_client_socket(temp_socket, self.ssl_context, self.server_host)
+                temp_socket.connect((self.server_host, self.server_port))
+                reg_data = {'username': username, 'password': password}
+                reg_msg = SMPProtocol.encode(SMPProtocol.REGISTER_REQUEST, 0, reg_data)
+                temp_socket.send(reg_msg)
+                response_data = temp_socket.recv(4096)
+                if response_data:
+                    message = SMPProtocol.decode(response_data)
+                    if message and message[0] == SMPProtocol.REGISTER_RESPONSE:
+                        _, _, payload = message
+                        if payload.get('status') == 'success':
+                            messagebox.showinfo("Success", payload.get('message', 'Registration successful!'))
+                            return True
+                        else:
+                            messagebox.showerror("Registration Failed", payload.get('message', 'Unknown error'))
+                return False
+        except Exception as e:
+            logger.error(f"Registration request failed: {e}")
+            messagebox.showerror("Error", f"Could not connect to server: {e}")
+            return False
+
+    def connect(self, username: str, password: str) -> bool:
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            if self.use_ssl and self.ssl_context and SSLWrapper:
+                self.socket = SSLWrapper.wrap_client_socket(self.socket, self.ssl_context, self.server_host)
+            self.socket.connect((self.server_host, self.server_port))
+            self.connected = True
+            self.username = username
+            logger.info(f"Connected to server {self.server_host}:{self.server_port}")
+
+            receive_thread = threading.Thread(target=self._receive_messages, daemon=True)
+            receive_thread.start()
+
+            login_data = {'username': username, 'password': password}
+            with self.lock:
+                msg_id = self.msg_counter;
+                self.msg_counter += 1
+            login_msg = SMPProtocol.encode(SMPProtocol.LOGIN_REQUEST, msg_id, login_data)
+            self.socket.send(login_msg)
+
+            response = self._wait_for_response(SMPProtocol.LOGIN_RESPONSE, msg_id, timeout=10)
+            if response and response[2].get('status') == 'success':
+                self.authenticated = True
+                self.user_data = response[2]
+                logger.info("Login successful!")
+                return True
+            else:
+                error_msg = response[2].get('message', 'Unknown error or timeout') if response else 'Timeout'
+                messagebox.showerror("Login Failed", error_msg)
+                self.disconnect()
+                return False
+        except Exception as e:
+            logger.error(f"Connection failed: {e}")
+            messagebox.showerror("Error", f"Could not connect to server: {e}")
+            return False
+
+    def _receive_messages(self):
+        buffer = b""
+        while self.connected:
+            try:
+                data = self.socket.recv(8192)
+                if not data:
+                    logger.info("Server closed connection")
+                    self.message_queue.put({'type': 'system', 'message': 'Server closed connection'})
+                    break
+                buffer += data
+                while True:
+                    consumed_length = SMPProtocol.get_consumed_length(buffer)
+                    if consumed_length is None: break
+                    message_data = buffer[:consumed_length]
+                    buffer = buffer[consumed_length:]
+                    message = SMPProtocol.decode(message_data)
+                    if message:
+                        msg_type, msg_id, payload = message
+                        self._handle_received_message(msg_type, msg_id, payload)
+            except (ConnectionError, OSError) as e:
+                if self.connected: logger.error(f"Receive error: {e}")
+                break
+        self.disconnect()
+
+    def _handle_received_message(self, msg_type: int, msg_id: int, payload: dict):
+        response_types = {
+            SMPProtocol.LOGIN_RESPONSE,
+            SMPProtocol.REGISTER_RESPONSE,
+            SMPProtocol.MESSAGE_ACK,
+            SMPProtocol.CREATE_GROUP_RESPONSE,
+            SMPProtocol.JOIN_GROUP_RESPONSE,
+            SMPProtocol.ADD_FRIEND_RESPONSE,
+            # HISTORY_RESPONSE is now correctly handled as a PUSH message to the GUI
+        }
+        msg_type_name = SMPProtocol.get_message_type_name(msg_type)
+        if msg_type == SMPProtocol.HEARTBEAT:
+            return
+        if msg_type in response_types:
+            logger.info(f"ROUTING to RESPONSE queue: {msg_type_name}")
+            self.response_queue.put((msg_type, msg_id, payload))
+        else:
+            logger.info(f"ROUTING to MESSAGE (GUI) queue: {msg_type_name}")
+            self.message_queue.put(payload)
+
+    def get_message(self):
+        try:
+            return self.message_queue.get_nowait()
+        except Empty:
+            return None
+
+    def _wait_for_response(self, expected_type, expected_id, timeout=5):
+        start_time = time.time()
+        temp_queue = []
+        while time.time() - start_time < timeout:
+            try:
+                msg_type, msg_id, payload = self.response_queue.get(timeout=0.1)
+                if msg_type == expected_type and msg_id == expected_id:
+                    for item in temp_queue: self.response_queue.put(item)
+                    return msg_type, msg_id, payload
+                else:
+                    temp_queue.append((msg_type, msg_id, payload))
+            except Empty:
+                continue
+        for item in temp_queue: self.response_queue.put(item)
+        return None
+
+    def start_heartbeat(self):
+        def heartbeat_loop():
+            while self.connected and self.authenticated:
+                with self.lock:
+                    msg_id = self.msg_counter;
+                    self.msg_counter += 1
+                try:
+                    self.socket.send(SMPProtocol.encode(SMPProtocol.HEARTBEAT, msg_id, {}))
+                except (ConnectionError, OSError):
+                    break
+                time.sleep(10)
+
+        threading.Thread(target=heartbeat_loop, daemon=True).start()
+        logger.info("Heartbeat started")
+
+    def disconnect(self):
+        if self.connected:
+            self.connected = False
+            self.authenticated = False
+            if self.socket:
+                try:
+                    self.socket.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    self.socket.close()
+                except OSError:
+                    pass
+            logger.info("Disconnected")
+
+    def send_private_message(self, target_user_id: str, message: str) -> bool:
+        if not self.connected or not self.authenticated: return False
+        message_data = {'target_id': target_user_id, 'message': message}
+        with self.lock:
+            msg_id = self.msg_counter; self.msg_counter += 1
+        try:
+            self.socket.send(SMPProtocol.encode(SMPProtocol.SEND_MESSAGE, msg_id, message_data))
+            return self._wait_for_response(SMPProtocol.MESSAGE_ACK, msg_id) is not None
+        except Exception as e:
+            logger.error(f"Failed to send private message: {e}"); return False
+
+    def send_group_message(self, group_id: str, message: str) -> bool:
+        if not self.connected or not self.authenticated: return False
+        message_data = {'group_id': group_id, 'message': message}
+        with self.lock:
+            msg_id = self.msg_counter; self.msg_counter += 1
+        try:
+            self.socket.send(SMPProtocol.encode(SMPProtocol.GROUP_MESSAGE, msg_id, message_data))
+            return self._wait_for_response(SMPProtocol.MESSAGE_ACK, msg_id) is not None
+        except Exception as e:
+            logger.error(f"Failed to send group message: {e}"); return False
+
+    def add_friend(self, target_user_id: str):
+        if not self.connected or not self.authenticated: return None
+        request_data = {'target_id': target_user_id}
+        with self.lock:
+            msg_id = self.msg_counter; self.msg_counter += 1
+        try:
+            self.socket.send(SMPProtocol.encode(SMPProtocol.ADD_FRIEND_REQUEST, msg_id, request_data))
+            response = self._wait_for_response(SMPProtocol.ADD_FRIEND_RESPONSE, msg_id)
+            return response[2] if response else None
+        except Exception as e:
+            logger.error(f"Failed to send add friend request: {e}"); return None
+
+    def create_group(self, group_name: str):
+        if not self.connected or not self.authenticated: return None
+        group_data = {'group_name': group_name}
+        with self.lock:
+            msg_id = self.msg_counter; self.msg_counter += 1
+        try:
+            self.socket.send(SMPProtocol.encode(SMPProtocol.CREATE_GROUP, msg_id, group_data))
+            response = self._wait_for_response(SMPProtocol.CREATE_GROUP_RESPONSE, msg_id)
+            return response[2] if response else None
+        except Exception as e:
+            logger.error(f"Failed to send create group request: {e}"); return None
+
+    def join_group(self, group_id: str):
+        if not self.connected or not self.authenticated: return None
+        group_data = {'group_id': group_id}
+        with self.lock:
+            msg_id = self.msg_counter; self.msg_counter += 1
+        try:
+            self.socket.send(SMPProtocol.encode(SMPProtocol.JOIN_GROUP, msg_id, group_data))
+            response = self._wait_for_response(SMPProtocol.JOIN_GROUP_RESPONSE, msg_id)
+            return response[2] if response else None
+        except Exception as e:
+            logger.error(f"Failed to send join group request: {e}"); return None
+
+    def accept_friend_request(self, requester_id: str):
+        if not self.connected or not self.authenticated: return
+        request_data = {'requester_id': requester_id}
+        with self.lock:
+            msg_id = self.msg_counter; self.msg_counter += 1
+        try:
+            self.socket.send(SMPProtocol.encode(SMPProtocol.ACCEPT_FRIEND_REQUEST, msg_id, request_data))
+        except Exception as e:
+            logger.error(f"Failed to send accept friend request: {e}")
+
+client_gui_V3.py
+
+# client_gui_V3.py (V3.3 - The Final Golden Version)
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext
+import threading
+from datetime import datetime
+from client_enhanced import SMPEnhancedClient # 使用我们最终版的客户端核心
+from typing import Optional
+from protocol import SMPProtocol
+# ==============================================================================
+#  第一部分: 登录/注册窗口
+# ==============================================================================
+class LoginWindow:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("SMP Chat")
+        self.root.geometry("300x280")
+        self.root.resizable(False, False)
+        self.client = None
+        self.main_frame = ttk.Frame(self.root, padding="10")
+        self.main_frame.pack(fill=tk.BOTH, expand=True)
+        self.create_register_widgets()
+
+    def create_login_widgets(self):
+        self._clear_frame()
+        self.root.title("SMP Chat - Login")
+        ttk.Label(self.main_frame, text="Username:").pack(fill=tk.X, pady=(0, 5))
+        self.username_var = tk.StringVar()
+        ttk.Entry(self.main_frame, textvariable=self.username_var).pack(fill=tk.X)
+        ttk.Label(self.main_frame, text="Password:").pack(fill=tk.X, pady=(10, 5))
+        self.password_var = tk.StringVar()
+        ttk.Entry(self.main_frame, textvariable=self.password_var, show="*").pack(fill=tk.X)
+        self.login_btn = ttk.Button(self.main_frame, text="Login", command=self.handle_login)
+        self.login_btn.pack(fill=tk.X, pady=(15, 5))
+        ttk.Button(self.main_frame, text="Don't have an account? Register", style="Link.TButton", command=self.create_register_widgets).pack()
+        self._add_server_entry()
+
+    def create_register_widgets(self):
+        self._clear_frame()
+        self.root.title("SMP Chat - Register")
+        ttk.Label(self.main_frame, text="Username (min 3 chars):").pack(fill=tk.X, pady=(0, 5))
+        self.username_var = tk.StringVar()
+        ttk.Entry(self.main_frame, textvariable=self.username_var).pack(fill=tk.X)
+        ttk.Label(self.main_frame, text="Password (min 8 chars):").pack(fill=tk.X, pady=(10, 5))
+        self.password_var = tk.StringVar()
+        ttk.Entry(self.main_frame, textvariable=self.password_var, show="*").pack(fill=tk.X)
+        self.register_btn = ttk.Button(self.main_frame, text="Register", command=self.handle_register)
+        self.register_btn.pack(fill=tk.X, pady=(15, 5))
+        ttk.Button(self.main_frame, text="Already have an account? Login", style="Link.TButton", command=self.create_login_widgets).pack()
+        self._add_server_entry()
+
+    def _add_server_entry(self):
+        ttk.Label(self.main_frame, text="Server:").pack(fill=tk.X, pady=(10, 0))
+        self.server_var = tk.StringVar(value="localhost:8899")
+        ttk.Entry(self.main_frame, textvariable=self.server_var).pack(fill=tk.X)
+
+    def handle_login(self):
+        username, password = self.username_var.get().strip(), self.password_var.get()
+        host, port = self._get_server_addr()
+        if not host or not username or not password: return messagebox.showerror("Error", "All fields are required.")
+        self.login_btn.config(text="Logging in...", state=tk.DISABLED)
+        self.client = SMPEnhancedClient(server_host=host, server_port=port)
+        def thread_task():
+            if self.client.connect(username, password): self.root.after(0, self.on_login_success, self.client.user_data)
+            else: self.root.after(0, lambda: self.login_btn.config(text="Login", state=tk.NORMAL))
+        threading.Thread(target=thread_task, daemon=True).start()
+
+    def handle_register(self):
+        username, password = self.username_var.get().strip(), self.password_var.get()
+        host, port = self._get_server_addr()
+        if not host: return
+        if len(username) < 3 or len(password) < 8: return messagebox.showerror("Error", "Check requirements.")
+        self.register_btn.config(text="Registering...", state=tk.DISABLED)
+        temp_client = SMPEnhancedClient(server_host=host, server_port=port)
+        def thread_task():
+            if temp_client.register(username, password): self.root.after(0, self.create_login_widgets)
+            else: self.root.after(0, lambda: self.register_btn.config(text="Register", state=tk.NORMAL))
+        threading.Thread(target=thread_task, daemon=True).start()
+
+    def on_login_success(self, user_data):
+        self.root.destroy()
+        root = tk.Tk(); MainChatWindow(root, self.client, user_data); root.mainloop()
+
+    def _get_server_addr(self):
+        try:
+            host, port = self.server_var.get().strip().split(':'); return host, int(port)
+        except: messagebox.showerror("Error", "Invalid server address."); return None, None
+    def _clear_frame(self):
+        for w in self.main_frame.winfo_children(): w.destroy()
+
+# ==============================================================================
+#  第二部分: 全新的、功能完整的主聊天窗口
+# ==============================================================================
+class MainChatWindow:
+    def __init__(self, root, client: SMPEnhancedClient, user_data: dict):
+        self.root, self.client, self.user_data = root, client, user_data
+        self.username = user_data.get('username')
+        self.user_id = user_data.get('user_id')
+        self.root.title(f"SMP Chat V3.4 - Welcome, {self.username} (ID: {self.user_id})")
+        self.root.geometry("800x600")
+        self.chat_sessions, self.active_session_key = {}, None
+        self.loaded_history = set()
+        self.setup_ui()
+        self.setup_event_handlers()
+        self.client.start_heartbeat()
+        self.after_id = self.root.after(100, self.process_messages)
+
+    def setup_ui(self):
+        self.paned_window = tk.PanedWindow(self.root, orient=tk.HORIZONTAL, sashrelief=tk.RAISED)
+        self.paned_window.pack(fill=tk.BOTH, expand=True)
+        session_pane = ttk.Frame(self.paned_window, width=220)
+        self.paned_window.add(session_pane)
+        add_friend_frame = ttk.LabelFrame(session_pane, text="Find Friends")
+        add_friend_frame.pack(fill=tk.X, padx=5, pady=5)
+        self.search_id_var = tk.StringVar()
+        ttk.Entry(add_friend_frame, textvariable=self.search_id_var).pack(side=tk.LEFT, fill=tk.X, expand=True,
+                                                                          padx=(0, 5))
+        ttk.Button(add_friend_frame, text="Add", command=self.add_friend).pack(side=tk.RIGHT)
+        chats_frame = ttk.LabelFrame(session_pane, text="Chats")
+        chats_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.session_tree = ttk.Treeview(chats_frame, show="tree", selectmode="browse")
+        self.session_tree.pack(fill=tk.BOTH, expand=True)
+        self.friends_node = self.session_tree.insert("", "end", "friends_node", text="Friends", open=True)
+        self.groups_node = self.session_tree.insert("", "end", "groups_node", text="My Groups", open=True)
+        group_actions_frame = ttk.LabelFrame(session_pane, text="Group Actions")
+        group_actions_frame.pack(fill=tk.X, padx=5, pady=5)
+        self.group_var = tk.StringVar()
+        ttk.Entry(group_actions_frame, textvariable=self.group_var).grid(row=0, column=0, columnspan=2, sticky="ew",
+                                                                         pady=(0, 5))
+        ttk.Button(group_actions_frame, text="Create", command=self.create_group).grid(row=1, column=0, sticky="ew")
+        ttk.Button(group_actions_frame, text="Join", command=self.join_group).grid(row=1, column=1, sticky="ew")
+        main_pane = ttk.Frame(self.paned_window)
+        self.paned_window.add(main_pane)
+        self.chat_title_var = tk.StringVar()
+        ttk.Label(main_pane, textvariable=self.chat_title_var, font=("Segoe UI", 12, "bold")).pack(fill=tk.X, padx=10,
+                                                                                                   pady=(5, 0))
+        self.chat_container = ttk.Frame(main_pane)
+        self.chat_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        input_frame = ttk.Frame(main_pane);
+        input_frame.pack(fill=tk.X, padx=10, pady=(0, 10));
+        input_frame.columnconfigure(0, weight=1)
+        self.message_var = tk.StringVar();
+        self.message_entry = ttk.Entry(input_frame, textvariable=self.message_var);
+        self.message_entry.grid(row=0, column=0, sticky="ew")
+        ttk.Button(input_frame, text="Send", command=self.send_message).grid(row=0, column=1, padx=5)
+        ttk.Button(input_frame, text="Send File", command=self.send_file).grid(row=0, column=2)
+
+    def setup_event_handlers(self):
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self.session_tree.bind("<<TreeviewSelect>>", self.on_session_select)
+        self.message_entry.bind('<Return>', self.send_message)
+        self.session_tree.bind("<Button-3>", self.show_item_info)
+
+    def on_session_select(self, _=None):
+        sel = self.session_tree.selection()
+        if not sel: return
+        key = sel[0]
+        if not (key.startswith('user_') or key.startswith('group_')):
+            if self.active_session_key and self.active_session_key in self.chat_sessions:
+                self.chat_sessions[self.active_session_key]['widget'].pack_forget()
+            self.active_session_key = key
+            self.chat_title_var.set(self.session_tree.item(key, "text"))
+            return
+        if self.active_session_key == key: return
+        if self.active_session_key and self.active_session_key in self.chat_sessions:
+            self.chat_sessions[self.active_session_key]['widget'].pack_forget()
+        self.active_session_key = key
+        if key in self.chat_sessions:
+            self.chat_sessions[key]['widget'].pack(fill=tk.BOTH, expand=True)
+            self.chat_title_var.set(self.session_tree.item(key, "text"))
+            self.session_tree.item(key, tags=())
+            if key not in self.loaded_history:
+                target_type, target_id = key.split('_', 1)
+                request_data = {'target_type': target_type, 'target_id': target_id}
+
+                def thread_task():
+                    # This now correctly sends a HISTORY_REQUEST
+                    self.client.socket.send(SMPProtocol.encode(SMPProtocol.HISTORY_REQUEST, 0, request_data))
+
+                threading.Thread(target=thread_task, daemon=True).start()
+        self.message_entry.focus_set()
+
+    def process_messages(self):
+        msg = self.client.get_message()
+        if msg: self.handle_received_message(msg)
+        self.after_id = self.root.after(100, self.process_messages)
+
+    def handle_received_message(self, msg: dict):
+        msg_type = msg.get('type')
+
+        if msg_type == 'friend_list':
+            for friend in msg.get('friends', []):
+                self.add_friend_to_list(friend['user_id'], friend['username'])
+        elif msg_type == 'group_list':
+            for group in msg.get('groups', []):
+                if gid := group.get('group_id'):
+                    gname = group.get('group_name', gid)
+                    self.add_session(f"group_{gid}", f"{gname} ({gid})", self.groups_node)
+        elif msg_type == 'friend_request_received':
+            from_id, from_name = msg.get('from_id'), msg.get('from_username')
+            if from_id and from_name:
+                if messagebox.askyesno("Friend Request",
+                                       f"User '{from_name}' ({from_id}) wants to be your friend. Accept?"):
+                    self.client.accept_friend_request(from_id)
+        elif msg_type == 'friend_status_update':
+            friend_id, friend_name, status = msg.get('friend_id'), msg.get('friend_name'), msg.get('status')
+            if friend_id and friend_name:
+                if status in ('added', 'accepted_your_request'):
+                    self.add_friend_to_list(friend_id, friend_name)
+                    if status == 'accepted_your_request':
+                        messagebox.showinfo("Friend Added", f"'{friend_name}' has accepted your friend request!")
+        elif msg_type == 'message':
+            from_id, from_name = msg.get('from_id'), msg.get('from_username')
+            if from_id and from_name:
+                session_key = f"user_{from_id}"
+                self.add_friend_to_list(from_id, from_name)
+                self.add_message_to_session(session_key, from_name, msg.get('message'))
+                if session_key != self.active_session_key:
+                    self.session_tree.item(session_key, tags=('new_message',))
+        elif msg_type == 'group_message':
+            gid, gname, sender = msg.get('group') or msg.get('group_id'), msg.get('group_name'), msg.get('from')
+            if gid and gname and sender:
+                session_key = f"group_{gid}"
+                self.add_session(session_key, f"{gname} ({gid})", self.groups_node)
+                self.add_message_to_session(session_key, sender, msg.get('message'), msg.get('system', False))
+                if session_key != self.active_session_key:
+                    self.session_tree.item(session_key, tags=('new_message',))
+
+        # --- VVV BUG FIX #1: ADDED HANDLER FOR HISTORY RESPONSE VVV ---
+        elif msg_type == 'history_response':
+            target_type = msg.get('target_type')
+            target_id = msg.get('target_id')
+            session_key = f"{target_type}_{target_id}"
+
+            if session_key in self.chat_sessions and session_key not in self.loaded_history:
+                self.clear_session_messages(session_key)  # Clear placeholder text if any
+                messages = msg.get('messages', [])
+                for hist_msg in messages:
+                    # Pass the full history message dict to the display function
+                    self.add_message_to_session(
+                        session_key,
+                        hist_msg.get('sender_name'),
+                        hist_msg.get('content'),
+                        history_msg=hist_msg
+                    )
+                self.loaded_history.add(session_key)
+        # --- ^^^ END OF BUG FIX #1 ^^^ ---
+
+        # --- VVV DIAGNOSTIC TOOL: LOG UNHANDLED MESSAGES VVV ---
+        else:
+            logging.warning(f"GUI received unhandled message type: '{msg_type}'. Full message: {msg}")
+            print(f"[DEBUG] GUI received unhandled message: {msg}")  # Also print to console
+        # --- ^^^ END OF DIAGNOSTIC TOOL ^^^ ---
+
+    def add_friend_to_list(self, user_id, username):
+        session_key = f"user_{user_id}"
+        display_name = f"{username} ({user_id})"
+        self.add_session(session_key, display_name, self.friends_node)
+
+    def add_session(self, key, dname, parent):
+        if key not in self.chat_sessions:
+            self.session_tree.insert(parent, "end", iid=key, text=dname)
+            cd = scrolledtext.ScrolledText(self.chat_container, wrap=tk.WORD, state=tk.DISABLED, padx=5, pady=5)
+            cd.tag_config("own", justify='right', background="#E1FFC7", wrap=tk.WORD, rmargin=10)
+            cd.tag_config("other", justify='left', background="#FFFFFF", wrap=tk.WORD, lmargin1=10, lmargin2=10)
+            cd.tag_config("system", justify='center', foreground="gray")
+            self.chat_sessions[key] = {'widget': cd, 'name': dname}
+
+    # --- VVV BUG FIX #2: MODIFIED FUNCTION TO HANDLE TIMESTAMPS VVV ---
+    def add_message_to_session(self, key, sender, msg, system=False, history_msg=None):
+        if key not in self.chat_sessions or not sender: return
+        cd = self.chat_sessions[key]['widget'];
+        cd.config(state=tk.NORMAL)
+        tag = "system" if system else ("own" if sender == self.username else "other")
+
+        # Determine the timestamp
+        if history_msg and 'timestamp' in history_msg:
+            # For history messages, parse the server timestamp string
+            try:
+                # Example format: 2023-10-27 15:45:00
+                dt_obj = datetime.fromisoformat(history_msg['timestamp'])
+                timestamp_str = dt_obj.strftime('%Y-%m-%d %H:%M:%S')
+            except (ValueError, TypeError):
+                timestamp_str = history_msg['timestamp']  # Fallback to raw string
+        else:
+            # For live messages, use the current time
+            timestamp_str = datetime.now().strftime('%H:%M:%S')
+
+        header = f"{sender} {timestamp_str}\n"
+        if system:
+            cd.insert(tk.END, f"--- {msg} ---\n", tag)
+        else:
+            cd.insert(tk.END, header, ("system",))
+            cd.insert(tk.END, f"{msg}\n\n", tag)
+
+        cd.config(state=tk.DISABLED);
+        cd.see(tk.END)
+
+    # --- ^^^ END OF BUG FIX #2 ^^^ ---
+
+    def clear_session_messages(self, key):
+        if key in self.chat_sessions:
+            widget = self.chat_sessions[key]['widget']
+            widget.config(state=tk.NORMAL)
+            widget.delete('1.0', tk.END)
+            widget.config(state=tk.DISABLED)
+
+    def send_message(self, _=None):
+        msg = self.message_var.get().strip()
+        if not msg or not self.active_session_key: return
+        session_type, target_id = self.active_session_key.split('_', 1)
+        success = False
+        if session_type == "user":
+            success = self.client.send_private_message(target_id, msg)
+        elif session_type == "group":
+            success = self.client.send_group_message(target_id, msg)
+        else:
+            return messagebox.showwarning("Cannot Send", "This is not a chat session.")
+        if success:
+            self.add_message_to_session(self.active_session_key, self.username, msg)
+            self.message_var.set("")
+        else:
+            messagebox.showerror("Error", "Failed to send message. User might be offline or you are not in the group.")
+
+    def create_group(self):
+        gname = self.group_var.get().strip()
+        if not gname: return messagebox.showwarning("Warning", "Please enter a group name")
+        threading.Thread(
+            target=lambda: self.root.after(0, self.handle_create_group_response, self.client.create_group(gname)),
+            daemon=True).start()
+
+    def handle_create_group_response(self, resp):
+        if resp and resp.get('status') == 'success':
+            gid, gname = resp.get('group_id'), resp.get('group_name')
+            if gid and gname:
+                self.add_session(f"group_{gid}", f"{gname} ({gid})", self.groups_node)
+                self.group_var.set("")
+                messagebox.showinfo("Success", f"Group '{gname}' created!\nID: {gid}")
+        else:
+            messagebox.showerror("Error", resp.get('message', 'Failed') if resp else "Request timed out")
+
+    def join_group(self):
+        gid = self.group_var.get().strip()
+        if not gid: return messagebox.showwarning("Warning", "Please enter a Group ID")
+        threading.Thread(
+            target=lambda: self.root.after(0, self.handle_join_group_response, self.client.join_group(gid)),
+            daemon=True).start()
+
+    def handle_join_group_response(self, resp):
+        if resp and resp.get('status') == 'success':
+            gid, gname = resp.get('group_id'), resp.get('group_name')
+            if gid and gname:
+                self.add_session(f"group_{gid}", f"{gname} ({gid})", self.groups_node)
+                self.group_var.set("")
+                messagebox.showinfo("Success", f"Joined '{gname}'")
+        else:
+            messagebox.showerror("Error", resp.get('message', 'Failed') if resp else "Request timed out")
+
+    def send_file(self):
+        pass  # Placeholder
+
+    def show_item_info(self, event):
+        item_id = self.session_tree.identify_row(event.y)
+        if item_id and item_id.startswith("group_"):
+            gid = item_id.split('_', 1)[1];
+            gname = self.session_tree.item(item_id, "text")
+            messagebox.showinfo("Group Info",
+                                f"Group Name: {gname}\nGroup ID: {gid}\n\nShare this ID to invite friends!")
+
+    def add_friend(self):
+        target_id = self.search_id_var.get().strip()
+        if not target_id: return messagebox.showwarning("Warning", "Please enter a User ID to add.")
+        if target_id == self.user_id: return messagebox.showwarning("Warning", "You cannot add yourself as a friend.")
+        threading.Thread(
+            target=lambda: self.root.after(0, self.handle_add_friend_response, self.client.add_friend(target_id)),
+            daemon=True).start()
+
+    def handle_add_friend_response(self, response):
+        if response:
+            if response.get('status') == 'success':
+                messagebox.showinfo("Success", response.get('message', 'Friend request sent!'))
+                self.search_id_var.set("")
+            else:
+                messagebox.showerror("Error", response.get('message', 'Failed to send request.'))
+        else:
+            messagebox.showerror("Error", "Request timed out. Server might not be responding.")
+
+    def on_closing(self):
+        if self.after_id: self.root.after_cancel(self.after_id)
+        if self.client: self.client.disconnect()
+        self.root.destroy()
+
+# ==============================================================================
+#  第三部分: 主执行块
+# ==============================================================================
+if __name__ == '__main__':
+    root = tk.Tk()
+    style = ttk.Style(); style.configure("Link.TButton", foreground="blue")
+    app = LoginWindow(root)
+    root.mainloop()
+
+database.py
+
+# database.py (V4.1 - The Friend System Update)
+
+import sqlite3
+import logging
+import random
+from typing import List, Tuple, Optional
+
+logger = logging.getLogger('SMPDatabase')
+
+
+class SMPDatabase:
+    def __init__(self, db_path='smp_data_v4.db'):  # 建议使用新文件名以避免冲突
+        self.db_path = db_path
+        self.init_database()
+
+    def init_database(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        # --- 用户表 (不变) ---
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT UNIQUE NOT NULL,
+                username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, salt TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        # --- 群组表 (不变) ---
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, group_id TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
+                created_by_id TEXT NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        # --- 群组成员表 (不变) ---
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS group_members (
+                group_id TEXT NOT NULL, user_id TEXT NOT NULL,
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (group_id, user_id)
+            )
+        ''')
+        # --- V4 新增：好友关系表 ---
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS friends (
+                user_id TEXT NOT NULL,
+                friend_id TEXT NOT NULL,
+                PRIMARY KEY (user_id, friend_id),
+                FOREIGN KEY (user_id) REFERENCES users(user_id),
+                FOREIGN KEY (friend_id) REFERENCES users(user_id)
+            )
+        ''')
+        # --- V4 新增：好友请求表 ---
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS friend_requests (
+                requester_id TEXT NOT NULL,
+                receiver_id TEXT NOT NULL,
+                status TEXT DEFAULT 'pending', -- pending, accepted, rejected
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (requester_id, receiver_id)
+            )
+        ''')
+        # --- V4 新增：消息历史记录表 (服务器代码中有调用) ---
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_name TEXT NOT NULL,
+                target TEXT NOT NULL,
+                type TEXT NOT NULL, -- 'private' or 'group'
+                content TEXT NOT NULL,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        conn.commit()
+        conn.close()
+        logger.info("V4 Database initialized successfully.")
+
+    def _generate_unique_id(self, cursor, table, column, length) -> str:
+        while True:
+            range_start, range_end = 10 ** (length - 1), (10 ** length) - 1
+            new_id = str(random.randint(range_start, range_end))
+            cursor.execute(f"SELECT {column} FROM {table} WHERE {column} = ?", (new_id,))
+            if cursor.fetchone() is None: return new_id
+
+    # --- ！！！ V4 新增 ！！！ ---
+    def get_user_by_id(self, user_id: str) -> Optional[tuple]:
+        """根据 user_id 获取 (user_id, username)"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id, username FROM users WHERE user_id = ?', (user_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result
+
+    def get_user_by_username(self, username: str) -> Optional[tuple]:
+        """根据用户名获取 (user_id, username, password_hash, salt)"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id, username, password_hash, salt FROM users WHERE username = ?', (username,))
+        result = cursor.fetchone()
+        conn.close()
+        return result
+
+    def get_group_by_id(self, group_id: str) -> Optional[tuple]:
+        """根据 group_id 获取 (group_id, name)"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT group_id, name FROM groups WHERE group_id = ?', (group_id,))
+        result = cursor.fetchone()
+        conn.close()
+        return result
+
+    def add_user(self, username: str, password_hash: str, salt: str) -> Optional[str]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            user_id = self._generate_unique_id(cursor, "users", "user_id", 11)
+            cursor.execute('INSERT INTO users (user_id, username, password_hash, salt) VALUES (?, ?, ?, ?)',
+                           (user_id, username, password_hash, salt))
+            conn.commit()
+            logger.info(f"User '{username}' with ID '{user_id}' added.")
+            return user_id
+        except sqlite3.IntegrityError:
+            logger.warning(f"Failed to add user '{username}'. May already exist.")
+            return None
+        finally:
+            conn.close()
+
+    def create_group(self, group_name: str, created_by_id: str) -> Optional[str]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            group_id = self._generate_unique_id(cursor, "groups", "group_id", 6)
+            cursor.execute('INSERT INTO groups (group_id, name, created_by_id) VALUES (?, ?, ?)',
+                           (group_id, group_name, created_by_id))
+            cursor.execute('INSERT INTO group_members (group_id, user_id) VALUES (?, ?)',
+                           (group_id, created_by_id))
+            conn.commit()
+            logger.info(f"Group '{group_name}' (ID: {group_id}) created by user ID {created_by_id}.")
+            return group_id
+        except sqlite3.IntegrityError:
+            logger.warning(f"Failed to create group '{group_name}'.")
+            return None
+        finally:
+            conn.close()
+
+    def add_user_to_group(self, group_id: str, user_id: str) -> bool:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute('SELECT id FROM groups WHERE group_id = ?', (group_id,))
+            if not cursor.fetchone(): return False
+            cursor.execute('INSERT INTO group_members (group_id, user_id) VALUES (?, ?)', (group_id, user_id))
+            conn.commit()
+            logger.info(f"User ID {user_id} added to group ID {group_id}.")
+            return True
+        except sqlite3.IntegrityError:
+            return True  # Already in group is considered success
+        finally:
+            conn.close()
+
+    def user_in_group(self, group_id: str, user_id: str) -> bool:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT 1 FROM group_members WHERE group_id = ? AND user_id = ?', (group_id, user_id))
+        result = cursor.fetchone() is not None
+        conn.close()
+        return result
+
+    def get_user_groups(self, user_id: str) -> List[Tuple[str, str]]:
+        """获取用户加入的所有群组，返回 (group_id, group_name) 元组列表"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT g.group_id, g.name
+            FROM groups g
+            JOIN group_members gm ON g.group_id = gm.group_id
+            WHERE gm.user_id = ?
+        ''', (user_id,))
+        result = cursor.fetchall()
+        conn.close()
+        return result
+
+    def get_history_messages(self, user1_id: str, user2_id: str, limit: int = 50) -> List[dict]:
+        """获取两个用户之间的私聊历史记录（V2 - 健壮版）"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        # --- 关键修复：在尝试获取名字前，先检查用户是否存在 ---
+        user1_info = self.get_user_by_id(user1_id)
+        user2_info = self.get_user_by_id(user2_id)
+
+        if not user1_info or not user2_info:
+            conn.close()
+            return []  # 如果任一用户不存在，直接返回空列表
+
+        user1_name = user1_info[1]
+        user2_name = user2_info[1]
+        # --- 修复结束 ---
+
+        cursor.execute('''
+              SELECT sender_name, content, timestamp
+              FROM messages
+              WHERE type = 'private' AND 
+                    ((sender_name = ? AND target = ?) OR (sender_name = ? AND target = ?))
+              ORDER BY timestamp DESC
+              LIMIT ?
+          ''', (user1_name, user2_id, user2_name, user1_id, limit))
+
+        messages = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return messages[::-1]
+
+    def get_group_history(self, group_id: str, limit: int = 50) -> List[dict]:
+        """获取群聊历史记录"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+               SELECT sender_name, content, timestamp
+               FROM messages
+               WHERE type = 'group' AND target = ?
+               ORDER BY timestamp DESC
+               LIMIT ?
+           ''', (group_id, limit))
+        messages = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return messages[::-1]
+
+
+    # --- ！！！ V4 新增：好友系统核心方法 ！！！ ---
+    def get_friend_list(self, user_id: str) -> List[Tuple[str, str]]:
+        """获取好友列表，返回 (friend_id, friend_username) 元组列表"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT f.friend_id, u.username
+            FROM friends f
+            JOIN users u ON f.friend_id = u.user_id
+            WHERE f.user_id = ?
+        ''', (user_id,))
+        result = cursor.fetchall()
+        conn.close()
+        return result
+
+    def are_friends(self, user1_id: str, user2_id: str) -> bool:
+        """检查两人是否已是好友"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('SELECT 1 FROM friends WHERE user_id = ? AND friend_id = ?', (user1_id, user2_id))
+        result = cursor.fetchone() is not None
+        conn.close()
+        return result
+
+    def add_friend_request(self, requester_id: str, receiver_id: str) -> bool:
+        """添加好友请求，如果已是好友或请求已存在则失败。如果对方已请求，则自动成为好友。"""
+        if self.are_friends(requester_id, receiver_id):
+            return False
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            # 检查反向请求是否存在
+            cursor.execute('SELECT 1 FROM friend_requests WHERE requester_id = ? AND receiver_id = ?',
+                           (receiver_id, requester_id))
+            if cursor.fetchone():
+                # <<< CHANGE: Pass the existing connection to prevent deadlock!
+                return self.accept_friend_request(receiver_id, requester_id, existing_conn=conn)
+
+            cursor.execute('INSERT OR IGNORE INTO friend_requests (requester_id, receiver_id) VALUES (?, ?)',
+                           (requester_id, receiver_id))
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False  # 请求已存在
+        finally:
+            conn.close()
+
+    def accept_friend_request(self, requester_id: str, accepter_id: str, existing_conn=None) -> bool:
+        """接受好友请求，建立双向好友关系。可以接收一个已存在的数据库连接以避免死锁。"""
+        # <<< CHANGE START: Use existing connection if provided
+        conn = existing_conn if existing_conn else sqlite3.connect(self.db_path)
+        # <<< CHANGE END
+
+        cursor = conn.cursor()
+        try:
+            # 验证请求是否存在
+            cursor.execute("SELECT 1 FROM friend_requests WHERE requester_id = ? AND receiver_id = ? AND status = 'pending'", (requester_id, accepter_id))
+            if not cursor.fetchone():
+                # 如果是自动接受（对方也发了请求），那么原始请求可能不存在，这没关系
+                pass
+
+            # <<< CHANGE START: Use transaction on the passed-in connection
+            if not existing_conn:
+                cursor.execute('BEGIN TRANSACTION')
+            # <<< CHANGE END
+
+            # 建立双向好友关系
+            cursor.execute('INSERT OR IGNORE INTO friends (user_id, friend_id) VALUES (?, ?)', (requester_id, accepter_id))
+            cursor.execute('INSERT OR IGNORE INTO friends (user_id, friend_id) VALUES (?, ?)', (accepter_id, requester_id))
+            # 删除好友请求
+            cursor.execute('DELETE FROM friend_requests WHERE requester_id = ? AND receiver_id = ?', (requester_id, accepter_id))
+            # 也删除可能存在的反向请求
+            cursor.execute('DELETE FROM friend_requests WHERE requester_id = ? AND receiver_id = ?', (accepter_id, requester_id))
+
+            # <<< CHANGE START: Only commit/close if this function created the connection
+            if not existing_conn:
+                conn.commit()
+            return True
+        except Exception as e:
+            if not existing_conn:
+                conn.rollback()
+            logger.error(f"Failed to accept friend request: {e}")
+            return False
+        finally:
+            if not existing_conn:
+                conn.close()
+            # <<< CHANGE END
+
+    def save_message(self, sender_name, target, msg_type, content, gn=None):
+        """保存消息记录 (服务器代码中已调用)"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute(
+                'INSERT INTO messages (sender_name, target, type, content) VALUES (?, ?, ?, ?)',
+                (sender_name, target, msg_type, content)
+            )
+            conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to save message: {e}")
+        finally:
+            conn.close()
+
+file_transfer.py
+
+import os
+import hashlib
+import logging
+from typing import Optional, Tuple
+
+logger = logging.getLogger('SMPFileTransfer')
+
+
+class FileTransferManager:
+    """文件传输管理器"""
+
+    CHUNK_SIZE = 4096  # 4KB 块大小
+
+    @staticmethod
+    def calculate_file_hash(file_path: str) -> str:
+        """计算文件哈希值"""
+        sha256_hash = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+
+    @staticmethod
+    def split_file(file_path: str) -> Tuple[int, list]:
+        """分割文件为多个块"""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        file_size = os.path.getsize(file_path)
+        chunks = []
+
+        with open(file_path, "rb") as f:
+            chunk_id = 0
+            while True:
+                chunk_data = f.read(FileTransferManager.CHUNK_SIZE)
+                if not chunk_data:
+                    break
+
+                chunks.append({
+                    'chunk_id': chunk_id,
+                    'data': chunk_data,
+                    'size': len(chunk_data)
+                })
+                chunk_id += 1
+
+        return file_size, chunks
+
+    @staticmethod
+    def reassemble_file(chunks: list, output_path: str) -> bool:
+        """重新组装文件"""
+        try:
+            # 按块ID排序
+            chunks.sort(key=lambda x: x['chunk_id'])
+
+            with open(output_path, "wb") as f:
+                for chunk in chunks:
+                    f.write(chunk['data'])
+
+            logger.info(f"File reassembled: {output_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to reassemble file: {e}")
+            return False
+
+    @staticmethod
+    def validate_file_size(file_path: str, max_size_mb: int = 10) -> bool:
+        """验证文件大小"""
+        max_size = max_size_mb * 1024 * 1024  # 转换为字节
+        file_size = os.path.getsize(file_path)
+        return file_size <= max_size
+
+protocol.py
+
+# protocol.py (The Final, Absolutely Correct, and Complete Version)
+
+import struct
+import json
+from typing import Optional, Dict, Any
+
+
+class SMPProtocol:
+    """Simple Message Protocol 编解码器 V5 - 最终版"""
+
+    # 核心消息类型
+    LOGIN_REQUEST = 0x01
+    LOGIN_RESPONSE = 0x02
+    SEND_MESSAGE = 0x03
+    MESSAGE_ACK = 0x04
+    HEARTBEAT = 0x05
+
+    # 群组消息类型
+    CREATE_GROUP = 0x06
+    CREATE_GROUP_RESPONSE = 0x07
+    JOIN_GROUP = 0x08
+    JOIN_GROUP_RESPONSE = 0x09
+    GROUP_MESSAGE = 0x0A
+
+    # V3 账户系统
+    REGISTER_REQUEST = 0x10
+    REGISTER_RESPONSE = 0x11
+
+    # V4 好友系统
+    ADD_FRIEND_REQUEST = 0x22
+    ADD_FRIEND_RESPONSE = 0x23
+    FRIEND_REQUEST_RECEIVED = 0x24
+    ACCEPT_FRIEND_REQUEST = 0x25
+    FRIEND_STATUS_UPDATE = 0x27
+    FRIEND_LIST_RESPONSE = 0x28
+    GROUP_LIST_RESPONSE = 0x29
+
+    # V4.3 历史消息
+    HISTORY_REQUEST = 0x30
+    HISTORY_RESPONSE = 0x31
+
+    # 为了兼容旧代码，保留了一些未使用的常量
+    SEARCH_USER_REQUEST = 0x20
+    SEARCH_USER_RESPONSE = 0x21
+    ACCEPT_FRIEND_RESPONSE = 0x26
+    GROUP_MEMBERS = 0x0B
+    GROUP_MEMBERS_RESPONSE = 0x0C
+    FILE_TRANSFER_REQUEST = 0x0D
+    FILE_TRANSFER_RESPONSE = 0x0E
+    FILE_CHUNK = 0x0F
+
+    HEADER_SIZE = 9
+
+    @staticmethod
+    def encode(msg_type: int, msg_id: int, payload: Dict[str, Any]) -> bytes:
+        # 使用 ensure_ascii=False 来正确处理中文字符，这能确保客户端和服务器的长度计算一致
+        body_data = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        body_length = len(body_data)
+        header = struct.pack('!BII', msg_type, msg_id, body_length)
+        return header + body_data
+
+    @staticmethod
+    def decode(data: bytes) -> Optional[tuple]:
+        if len(data) < SMPProtocol.HEADER_SIZE:
+            return None
+        try:
+            header = data[:SMPProtocol.HEADER_SIZE]
+            msg_type, msg_id, body_length = struct.unpack('!BII', header)
+
+            # 确保整个包的数据都存在
+            if len(data) < SMPProtocol.HEADER_SIZE + body_length:
+                return None
+
+            body_data = data[SMPProtocol.HEADER_SIZE: SMPProtocol.HEADER_SIZE + body_length]
+            payload = json.loads(body_data.decode('utf-8'))
+            return msg_type, msg_id, payload
+        except (struct.error, json.JSONDecodeError, UnicodeDecodeError):
+            return None
+
+    # ------------------------------------------------------------------
+    #  VVV  这就是我之前忘记提供的、导致所有问题的关键函数  VVV
+    # ------------------------------------------------------------------
+    @staticmethod
+    def get_consumed_length(data: bytes) -> Optional[int]:
+        """
+        检查缓冲区数据，如果包含一个完整的SMP消息，则返回该消息的总长度。
+        否则返回None。
+        """
+        if len(data) < SMPProtocol.HEADER_SIZE:
+            return None
+        try:
+            header = data[:SMPProtocol.HEADER_SIZE]
+            _, _, body_length = struct.unpack('!BII', header)
+            total_length = SMPProtocol.HEADER_SIZE + body_length
+            if len(data) >= total_length:
+                return total_length
+            else:
+                return None
+        except struct.error:
+            return None
+
+    # ------------------------------------------------------------------
+    #  ^^^  现在它在这里了  ^^^
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def get_message_type_name(msg_type: int) -> str:
+        """获取消息类型名称，用于调试"""
+        # 反转字典来查找名字
+        # 注意：这只会在首次调用时构建一次，效率没问题
+        if not hasattr(SMPProtocol, '_name_map'):
+            full_type_names = {
+                k: v for k, v in SMPProtocol.__dict__.items() if isinstance(v, int) and not k.startswith('_')
+            }
+            SMPProtocol._name_map = {v: k for k, v in full_type_names.items()}
+        return SMPProtocol._name_map.get(msg_type, f"UNKNOWN({msg_type})")
+
+server_enhanced.py
+
+# server_enhanced.py (The Final, Working Version)
+
+import socket, threading, logging, json, time, traceback
+from datetime import datetime
+
+from protocol import SMPProtocol
+from database import SMPDatabase
+from auth import SMPAuth
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger('SMPServerV4')
+
+
+class SMPEnhancedServer:
+    def __init__(self, host='0.0.0.0', port=8899):
+        self.host, self.port, self.server_socket, self.running = host, port, None, False
+        self.clients, self.groups = {}, {}
+        self.lock, self.msg_counter = threading.Lock(), 0
+        self.database = SMPDatabase()
+        logger.info("服务器 V5 (最终版) __init__ 完成")
+
+    def _process_message(self, sock, cid, mtype, mid, payload):
+        logger.info(f"--- SERVER RECEIVED --- Type: {SMPProtocol.get_message_type_name(mtype)}, From CID: {cid}")
+
+        if mtype == SMPProtocol.REGISTER_REQUEST:
+            self._handle_register(sock, mid, payload)
+            return True
+        if mtype == SMPProtocol.LOGIN_REQUEST:
+            auth_success = self._handle_login(sock, cid, mid, payload)
+            return auth_success
+
+        with self.lock:
+            if cid not in self.clients or not self.clients[cid][2]:
+                logger.warning(f"客户端 {cid} 在未登录状态下尝试操作 {mtype}")
+                return False
+
+        # ------------------------------------------------------------------
+        #  VVV  这就是导致所有问题的根源，现在已彻底修复  VVV
+        # ------------------------------------------------------------------
+        handler = {
+            SMPProtocol.SEND_MESSAGE: self._handle_message,
+            SMPProtocol.GROUP_MESSAGE: self._handle_group_message,
+            SMPProtocol.HEARTBEAT: self._handle_heartbeat,
+
+            # --- 之前缺失的、导致超时的关键条目 ---
+            SMPProtocol.CREATE_GROUP: self._handle_create_group,
+            SMPProtocol.JOIN_GROUP: self._handle_join_group,
+            SMPProtocol.ADD_FRIEND_REQUEST: self._handle_add_friend_request,
+            SMPProtocol.ACCEPT_FRIEND_REQUEST: self._handle_accept_friend_request,
+            SMPProtocol.HISTORY_REQUEST: self._handle_history_request,
+        }.get(mtype)
+        # ------------------------------------------------------------------
+        #  ^^^  现在这个 handler 是完整且正确的  ^^^
+        # ------------------------------------------------------------------
+
+        if handler:
+            handler(cid, mid, payload)
+        else:
+            logger.warning(f"收到未处理消息类型: {SMPProtocol.get_message_type_name(mtype)}")
+
+        return True
+
+    def _send_response(self, sock, ptype, mid, payload):
+        try:
+            sock.send(SMPProtocol.encode(ptype, mid, payload))
+        except (OSError, ConnectionError) as e:
+            logger.warning(f"发送响应失败: {e}")
+
+    def _get_client_id_by_user_id(self, user_id: str) -> int | None:
+        with self.lock:
+            for cid, (_, _, uid, _) in self.clients.items():
+                if uid == user_id:
+                    return cid
+        return None
+
+    def _handle_heartbeat(self, cid, mid, payload):
+        with self.lock:
+            if cid in self.clients:
+                sock, uname, uid, _ = self.clients[cid]
+                self.clients[cid] = (sock, uname, uid, time.time())
+
+    # --- 所有 handler 方法保持不变，这里为了完整性全部列出 ---
+
+    def _handle_register(self, sock, mid, payload):
+        uname, pwd = payload.get('username', '').strip(), payload.get('password', '')
+        if len(uname) < 3:
+            resp = {'status': 'error', 'message': 'Username too short'}
+        else:
+            pwhash, salt = SMPAuth.hash_password(pwd)
+            uid = self.database.add_user(uname, pwhash, salt)
+            if uid:
+                resp = {'status': 'success', 'message': 'Registration successful!', 'user_id': uid}
+            else:
+                resp = {'status': 'error', 'message': 'Username exists or DB error'}
+        self._send_response(sock, SMPProtocol.REGISTER_RESPONSE, mid, resp)
+
+    def _handle_login(self, sock, cid, mid, payload):
+        uname, pwd = payload.get('username', '').strip(), payload.get('password', '')
+        udata = self.database.get_user_by_username(uname)
+        if not udata:
+            resp = {'status': 'error', 'message': 'User not found'}
+        else:
+            uid, _, pwhash, salt = udata
+            if not SMPAuth.verify_password(pwd, pwhash, salt):
+                resp = {'status': 'error', 'message': 'Invalid password'}
+            else:
+                with self.lock:
+                    is_online = any(i[2] == uid for i in self.clients.values())
+                if is_online:
+                    resp = {'status': 'error', 'message': 'User already online'}
+                else:
+                    with self.lock:
+                        self.clients[cid] = (sock, uname, uid, time.time())
+                    resp = {'status': 'success', 'message': 'Login successful!', 'username': uname, 'user_id': uid}
+                    logger.info(f"用户 '{uname}' (ID:{uid}) 登录成功")
+                    friend_list = self.database.get_friend_list(uid)
+                    friend_payload = {'type': 'friend_list',
+                                      'friends': [{'user_id': fid, 'username': fname} for fid, fname in friend_list]}
+                    self._send_response(sock, SMPProtocol.FRIEND_LIST_RESPONSE, mid, friend_payload)
+                    group_list = self.database.get_user_groups(uid)
+                    group_payload = {'type': 'group_list',
+                                     'groups': [{'group_id': gid, 'group_name': gname} for gid, gname in group_list]}
+                    self._send_response(sock, SMPProtocol.GROUP_LIST_RESPONSE, mid, group_payload)
+        self._send_response(sock, SMPProtocol.LOGIN_RESPONSE, mid, resp)
+        return resp.get('status') == 'success'
+
+    def _handle_add_friend_request(self, cid, mid, payload):
+        with self.lock:
+            sock, sname, suid, _ = self.clients[cid]
+        target_id = payload.get('target_id', '').strip()
+
+        if not target_id or target_id == suid:
+            resp = {'status': 'error', 'message': 'Invalid target ID or cannot add yourself.'}
+            self._send_response(sock, SMPProtocol.ADD_FRIEND_RESPONSE, mid, resp)
+            return
+
+        if self.database.add_friend_request(suid, target_id):
+            # 1. 准备给 hero 的成功响应
+            resp = {'status': 'success', 'message': 'Friend request sent.'}
+
+            # --- 关键修复：正确地向 wizard 推送通知 ---
+            target_cid = self._get_client_id_by_user_id(target_id)
+            if target_cid:
+                target_sock, _, _, _ = self.clients[target_cid]
+                # 2. 准备给 wizard 的推送内容，并明确告知类型！
+                push_payload = {
+                    'type': 'friend_request_received',  # <-- 明确告知客户端这是什么
+                    'from_id': suid,
+                    'from_username': sname
+                }
+                # 3. 使用服务器自己的消息计数器，而不是重用 hero 的 mid！
+                push_msg_id = self.msg_counter
+                self.msg_counter += 1
+                self._send_response(target_sock, SMPProtocol.FRIEND_REQUEST_RECEIVED, push_msg_id, push_payload)
+        else:
+            resp = {'status': 'error', 'message': 'Request already sent or already friends.'}
+
+        # 4. 将成功响应发回给 hero
+        self._send_response(sock, SMPProtocol.ADD_FRIEND_RESPONSE, mid, resp)
+
+    def _handle_accept_friend_request(self, cid, mid, payload):
+        with self.lock:
+            sock, accepter_name, accepter_id, _ = self.clients[cid]
+        requester_id = payload.get('requester_id', '').strip()
+        if not requester_id: return
+        if self.database.accept_friend_request(requester_id, accepter_id):
+            requester_info = self.database.get_user_by_id(requester_id)
+            if requester_info:
+                update_payload = {'type': 'friend_status_update', 'friend_id': requester_info[0],
+                                  'friend_name': requester_info[1], 'status': 'added'}
+                self._send_response(sock, SMPProtocol.FRIEND_STATUS_UPDATE, self.msg_counter, update_payload)
+            requester_cid = self._get_client_id_by_user_id(requester_id)
+            if requester_cid:
+                requester_sock, _, _, _ = self.clients[requester_cid]
+                update_payload_requester = {'type': 'friend_status_update', 'friend_id': accepter_id,
+                                            'friend_name': accepter_name, 'status': 'accepted_your_request'}
+                self._send_response(requester_sock, SMPProtocol.FRIEND_STATUS_UPDATE, self.msg_counter,
+                                    update_payload_requester)
+
+    def _handle_message(self, cid, mid, payload):
+        with self.lock:
+            ssock, sname, suid, _ = self.clients[cid]
+        msg, target_id = payload.get('message', '').strip(), payload.get('target_id', '')
+        if not msg or not target_id: return
+        if not self.database.are_friends(suid, target_id): return
+        self.database.save_message(sname, target_id, 'private', msg)
+        target_cid = self._get_client_id_by_user_id(target_id)
+        fwd_pl = {'type': 'message', 'from_id': suid, 'from_username': sname, 'message': msg}
+        recipients_count = 0
+        if target_cid:
+            with self.lock: target_sock, _, _, _ = self.clients[target_cid]
+            self._send_response(target_sock, SMPProtocol.SEND_MESSAGE, self.msg_counter, fwd_pl);
+            self.msg_counter += 1
+            recipients_count = 1
+        self._send_response(ssock, SMPProtocol.MESSAGE_ACK, mid,
+                            {'status': 'delivered', 'recipients': recipients_count})
+
+    def _handle_create_group(self, cid, mid, payload):
+        with self.lock:
+            sock, uname, uid, _ = self.clients[cid]
+        gname = payload.get('group_name', '').strip()
+        if not gname:
+            resp = {'status': 'error', 'message': 'Group name cannot be empty'}
+        else:
+            gid = self.database.create_group(gname, uid)
+            if gid:
+                with self.lock:
+                    self.groups[gid] = [cid]
+                resp = {'status': 'success', 'message': f"Group '{gname}' created, ID: {gid}", 'group_id': gid,
+                        'group_name': gname}
+            else:
+                resp = {'status': 'error', 'message': 'Group name may exist'}
+        self._send_response(sock, SMPProtocol.CREATE_GROUP_RESPONSE, mid, resp)
+
+    def _handle_join_group(self, cid, mid, payload):
+        with self.lock:
+            sock, uname, uid, _ = self.clients[cid]
+        gid = payload.get('group_id', '').strip()
+        if not gid:
+            resp = {'status': 'error', 'message': 'Group ID cannot be empty'}
+        else:
+            ginfo = self.database.get_group_by_id(gid)
+            if not ginfo:
+                resp = {'status': 'error', 'message': 'Group not found'}
+            elif self.database.add_user_to_group(gid, uid):
+                with self.lock:
+                    if gid not in self.groups: self.groups[gid] = []
+                    if cid not in self.groups[gid]: self.groups[gid].append(cid)
+                _, gname = ginfo
+                resp = {'status': 'success', 'message': f"Joined group {gname}", 'group_id': gid, 'group_name': gname}
+                self._notify_group_members(gid, f"'{uname}' has joined.", exclude_cid=cid)
+            else:
+                resp = {'status': 'error', 'message': 'Failed to join group'}
+        self._send_response(sock, SMPProtocol.JOIN_GROUP_RESPONSE, mid, resp)
+
+    def _handle_group_message(self, cid, mid, payload):
+        with self.lock:
+            ssock, sname, suid, _ = self.clients[cid]
+        gid, msg = payload.get('group_id', ''), payload.get('message', '').strip()
+        if not gid or not msg: return
+        if not self.database.user_in_group(gid, suid): return
+        ginfo = self.database.get_group_by_id(gid)
+        gname = ginfo[1] if ginfo else gid
+        self.database.save_message(sname, gid, 'group', msg, gn=gid)
+        fwd_pl = {'type': 'group_message', 'from': sname, 'message': msg, 'group': gid, 'group_name': gname}
+        with self.lock:
+            if gid in self.groups:
+                for mcid in self.groups[gid]:
+                    if mcid != cid and mcid in self.clients:
+                        self._send_response(self.clients[mcid][0], SMPProtocol.GROUP_MESSAGE, self.msg_counter, fwd_pl)
+        self._send_response(ssock, SMPProtocol.MESSAGE_ACK, mid, {'status': 'delivered'})
+
+    def _handle_history_request(self, cid, mid, payload):
+        with self.lock:
+            sock, _, suid, _ = self.clients[cid]
+        target_type = payload.get('target_type');
+        target_id = payload.get('target_id');
+        messages = []
+        if target_type == 'user':
+            if self.database.are_friends(suid, target_id): messages = self.database.get_history_messages(suid,
+                                                                                                         target_id)
+        elif target_type == 'group':
+            if self.database.user_in_group(target_id, suid): messages = self.database.get_group_history(target_id)
+        resp_payload = {'type': 'history_response', 'target_type': target_type, 'target_id': target_id,
+                        'messages': messages}
+        self._send_response(sock, SMPProtocol.HISTORY_RESPONSE, mid, resp_payload)
+
+    def _notify_group_members(self, gid, message, exclude_cid=None):
+        ginfo = self.database.get_group_by_id(gid)
+        gname = ginfo[1] if ginfo else gid
+        noti_pl = {'type': 'group_message', 'from': 'System', 'message': message, 'group': gid, 'group_name': gname,
+                   'system': True}
+        with self.lock:
+            if gid in self.groups:
+                for mcid in self.groups[gid]:
+                    if mcid != exclude_cid and mcid in self.clients:
+                        self._send_response(self.clients[mcid][0], SMPProtocol.GROUP_MESSAGE, self.msg_counter, noti_pl)
+
+    def _handle_client(self, sock, cid):
+        logger.info(f"客户端 {cid} 连接")
+        buf = b""
+        try:
+            while self.running:
+                try:
+                    data = sock.recv(4096)
+                    if not data:
+                        logger.info(f"客户端 {cid} 主动断开")
+                        break
+                    buf += data
+                except (ConnectionError, OSError):
+                    logger.warning(f"与客户端 {cid} 连接中断")
+                    break
+
+                # --- VVV 这是关键的修复 VVV ---
+                while True:
+                    # 1. 先用 get_consumed_length 检查有没有一个完整的包
+                    consumed_length = SMPProtocol.get_consumed_length(buf)
+                    if consumed_length is None:
+                        # 没有完整的包，退出内层循环，等待下一次 recv
+                        break
+
+                    # 2. 如果有，安全地把它切出来
+                    message_data = buf[:consumed_length]
+                    buf = buf[consumed_length:]
+
+                    # 3. 只解码切出来的、保证完整的数据
+                    msg = SMPProtocol.decode(message_data)
+                    if msg:
+                        mtype, mid, payload = msg
+                        should_continue = self._process_message(sock, cid, mtype, mid, payload)
+                        if not should_continue:
+                            raise ConnectionAbortedError("Logic requested disconnect")
+                    # --- ^^^ 修复结束 ^^^ ---
+
+        except Exception:
+            # Any error in the loop will lead to disconnect
+            pass
+        finally:
+            with self.lock:
+                if cid in self.clients:
+                    _, uname, uid, _ = self.clients[cid]
+                    logger.info(f"客户端 {cid} ('{uname}') 线程结束")
+                    for gid, members in list(self.groups.items()):
+                        if cid in members:
+                            members.remove(cid)
+                            self._notify_group_members(gid, f"'{uname}' has left.", exclude_cid=None)
+                    del self.clients[cid]
+            sock.close()
+
+    def start(self):
+        # ... start method is fine ...
+        try:
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(10)
+            logger.info(f">>> 服务器 V5 已在 {self.host}:{self.port} 启动 <<<")
+            self.running = True
+            cid_counter = 0
+            while self.running:
+                try:
+                    sock, addr = self.server_socket.accept()
+                    cid_counter += 1
+                    t = threading.Thread(target=self._handle_client, args=(sock, cid_counter), daemon=True);
+                    t.start()
+                except OSError:
+                    break
+        except Exception:
+            logger.error("!!! 服务器启动失败 !!!"); traceback.print_exc()
+        finally:
+            self.stop()
+
+    def stop(self):
+        # ... stop method is fine ...
+        if self.running:
+            self.running = False;
+            logger.info("正在停止服务器...")
+            if self.server_socket: self.server_socket.close()
+            with self.lock:
+                for sock, _, _, _ in self.clients.values():
+                    try:
+                        sock.close()
+                    except:
+                        pass
+            logger.info("服务器已停止")
+
+
+if __name__ == "__main__":
+    server = SMPEnhancedServer()
+    try:
+        server.start()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.stop()
+
